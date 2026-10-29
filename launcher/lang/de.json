@@ -1,5 +1,6 @@
 {
   "Home": "Startseite",
+  "{version} is not installed": "{version} ist nicht installiert",
   "Builds": "Instanzen",
   "New build": "Neue Instanz",
   "Every build in one list: the version it plays, and whether that version is ready.": "Jede Instanz in einer Zeile: die Version, die sie startet, und ob sie bereit ist.",

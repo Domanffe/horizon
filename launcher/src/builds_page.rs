@@ -31,11 +31,17 @@ impl Launcher {
             let tag = self.version_of(&instance).cloned();
             let prepared = tag.as_deref().is_some_and(backend::is_prepared);
             let sub = match &instance.kind {
-                InstanceKind::Default | InstanceKind::Own => match (&tag, &instance.java) {
-                    (_, Some(java)) => format!("Minecraft {} · Java", java.minecraft),
-                    (Some(tag), None) if prepared => format!("{tag} · {}", tr("Ready")),
-                    (Some(tag), None) => format!("{tag} · {}", tr("Needs preparing")),
+                // The states the sidebar's row had, in the same order: a Java instance first.
+                InstanceKind::Default | InstanceKind::Own => match (&tag, &instance.version) {
+                    _ if instance.java.is_some() => format!(
+                        "Minecraft {} · Java",
+                        instance.java.as_ref().map_or("", |j| &j.minecraft)
+                    ),
+                    (None, Some(own)) => trf("{version} is not installed", &[("version", own)]),
                     (None, None) => tr("No version installed").to_string(),
+                    (Some(_), _) if !prepared => tr("Needs preparing").to_string(),
+                    (Some(tag), Some(_)) => format!("{} · {tag}", tr("Ready")),
+                    (Some(_), None) => tr("Ready").to_string(),
                 },
                 InstanceKind::Port => {
                     let slug = &instance.id["port:".len()..];
