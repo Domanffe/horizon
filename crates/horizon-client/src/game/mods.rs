@@ -907,9 +907,6 @@ impl Game<'_> {
     /// A mod pushes its screen (`ui.open-screen`), or Options > Mods opens
     /// its settings page (`settings`, the mod's `installed` index).
     pub(super) fn open_mod_screen(&mut self, owner: usize, settings: bool) {
-        if self.title.is_some() {
-            return;
-        }
         if settings {
             self.mods.mods.ui_settings_opened(owner);
             let keys = self.mods.mods.keys_of(owner);

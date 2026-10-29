@@ -6081,6 +6081,12 @@ impl Game<'_> {
             self.draw_options(&mut batch);
             return batch;
         }
+        // A mod's page opens over the title too: its widgets are its own, and
+        // the mods run before a world does.
+        if self.screen == Screen::Mod {
+            self.draw_mod_screen(&mut batch);
+            return batch;
+        }
         if let Some(title) = &mut self.title {
             title.poll_backup();
             if let Some(sound) = title.update_toast(self.settings.notification_display_time) {
@@ -13136,7 +13142,9 @@ impl ApplicationHandler for Game<'_> {
                     state: ElementState::Released,
                     button: MouseButton::Left,
                     ..
-                } if self.title.is_some() && self.screen != Screen::Options => {
+                } if self.title.is_some()
+                    && !matches!(self.screen, Screen::Options | Screen::Mod) =>
+                {
                     if let Some(title) = &mut self.title {
                         title.release();
                         title.release_field();
@@ -13146,7 +13154,10 @@ impl ApplicationHandler for Game<'_> {
                     state,
                     button: MouseButton::Left,
                     ..
-                } if self.title.is_some() && state == ElementState::Pressed => {
+                } if self.title.is_some()
+                    && state == ElementState::Pressed
+                    && self.screen != Screen::Mod =>
+                {
                     let size = self
                         .renderer
                         .as_ref()
@@ -13191,7 +13202,8 @@ impl ApplicationHandler for Game<'_> {
                         Action::None => {}
                     }
                 }
-                WindowEvent::MouseInput { .. } if self.title.is_some() => {}
+                WindowEvent::MouseInput { .. }
+                    if self.title.is_some() && self.screen != Screen::Mod => {}
                 WindowEvent::MouseInput { state, button, .. } if self.book.is_some() => {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         let size = self
@@ -13483,6 +13495,19 @@ impl ApplicationHandler for Game<'_> {
                     }
                     if let PhysicalKey::Code(key) = event.physical_key {
                         self.options_key(key, event.text.as_deref())?;
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if self.title.is_some()
+                        && self.screen == Screen::Mod
+                        && event.state == ElementState::Pressed =>
+                {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => self.close_mod_screen(true),
+                        PhysicalKey::Code(key) => {
+                            self.mod_screen_key(key);
+                        }
+                        _ => {}
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.title.is_some() => {
