@@ -32,9 +32,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// ServerCommonPacketListenerImpl.KEEPALIVE_TIME and the disconnect timeout.
+/// ServerCommonPacketListenerImpl.keepConnectionAlive: a keep-alive every 15 s,
+/// and a client that has not answered the last one by the next is dropped.
 const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(15);
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// ReadTimeoutHandler(30) in ServerConnectionListener: a connection that sends
+/// nothing for 30 s.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Packets queued for one client beyond this many bytes disconnect it.
 const MAX_PENDING: usize = 96 << 20;
 /// Vanilla's server-side disconnect during login is a JSON component.
@@ -677,9 +680,16 @@ fn serve_login(
         _ => return Err("expected a login hello".into()),
     };
     if !valid_name(&hello.name) {
+        // handleHello's validState throws; Connection.exceptionCaught sends the
+        // exception as the login disconnect.
         login_disconnect(
             &mut c,
-            &translatable("multiplayer.disconnect.invalid_name", &[]),
+            &translatable(
+                "disconnect.genericReason",
+                &[
+                    "Internal Exception: java.lang.IllegalStateException: Invalid characters in username",
+                ],
+            ),
         );
         return Ok(());
     }
@@ -844,6 +854,44 @@ fn login_and_configure(
             }),
         )?;
     }
+    if brand == "horizon"
+        && let Some(hash) = sync.content_identity
+    {
+        send(
+            c,
+            cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: crate::content_identity::CHANNEL.into(),
+                data: hash.to_vec(),
+            }),
+        )?;
+        send(c, cfg::Clientbound::Ping(cfg::Ping { id: 0 }))?;
+        let mut content_match = false;
+        loop {
+            let (id, payload) = c.recv().map_err(e)?;
+            match cfg::Serverbound::decode(id, &payload).map_err(e)? {
+                cfg::Serverbound::CustomPayload(p)
+                    if p.channel == crate::content_identity::CHANNEL =>
+                {
+                    content_match = p.data == hash;
+                }
+                cfg::Serverbound::Pong(p) if p.id == 0 => break,
+                cfg::Serverbound::ClientInformation(i) => info = i,
+                _ => {}
+            }
+        }
+        if !content_match {
+            let reason = horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from(
+                crate::content_identity::MISMATCH,
+            ));
+            let _ = send(c, cfg::Clientbound::Disconnect(cfg::Disconnect { reason }));
+            lost(
+                shared,
+                &format!("{name} ({})", uuid_string(uuid)),
+                crate::content_identity::MISMATCH,
+            );
+            return Ok(None);
+        }
+    }
     for packet in sync.registry_packets(known_pack) {
         send(c, cfg::Clientbound::RegistryData(packet))?;
     }
@@ -967,7 +1015,7 @@ fn offer_pack(
 fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::SocketAddr) {
     let conn_id = shared.next_id();
     let events = shared.events.clone();
-    let _ = c.reader.set_read_timeout(Some(KEEP_ALIVE_TIMEOUT));
+    let _ = c.reader.set_read_timeout(Some(READ_TIMEOUT));
     let (mut reader, writer) = c.split();
     let (tx, rx) = channel();
     let pending = Arc::new(AtomicUsize::new(0));
@@ -1250,7 +1298,7 @@ fn write_loop(
                 let old = latency.load(Ordering::Relaxed);
                 latency.store((old * 3 + ms) / 4, Ordering::Relaxed);
                 sent_at = None;
-            } else if at.elapsed() > KEEP_ALIVE_TIMEOUT {
+            } else if at.elapsed() >= KEEP_ALIVE_EVERY {
                 let _ = writer.send(
                     &play::Clientbound::Disconnect(cfg::Disconnect {
                         reason: translatable("disconnect.timeout", &[]),

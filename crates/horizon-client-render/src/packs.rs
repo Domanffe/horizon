@@ -466,6 +466,22 @@ fn build_overlay_uncached(
             files.insert(name, (i, provided));
         }
     }
+    // FallbackResourceManager: a file's `.mcmeta` counts only from the pack that
+    // supplies the file or one above it; vanilla's own sits below every pack.
+    let hidden: BTreeSet<String> = files
+        .iter()
+        .filter(|(name, _)| !name.ends_with(".mcmeta"))
+        .filter_map(|(name, (owner, _))| {
+            let meta = format!("{name}.mcmeta");
+            match files.get(&meta) {
+                Some((meta_owner, _)) if meta_owner >= owner => None,
+                _ => Some(meta),
+            }
+        })
+        .collect();
+    for name in &hidden {
+        files.remove(name);
+    }
     // Vanilla sits below every pack, so filters hide its files too.
     let filters: Vec<&Filter> = packs.iter().flat_map(|p| &p.filter).collect();
     let touched_dirs: BTreeSet<String> = files
@@ -517,6 +533,7 @@ fn build_overlay_uncached(
         vanilla: &Path,
         out: &Path,
         touched: &BTreeSet<String>,
+        hidden: &BTreeSet<String>,
         files: &BTreeMap<String, (usize, Provided)>,
         merged: &BTreeMap<String, Vec<u8>>,
         filters: &[&Filter],
@@ -553,6 +570,9 @@ fn build_overlay_uncached(
         }
         for name in names {
             let child = format!("{prefix}{name}");
+            if hidden.contains(&child) {
+                continue;
+            }
             if let Some(bytes) = merged.get(&child) {
                 fs::write(out.join(&child), bytes)?;
             } else if let Some((owner, (path, inner))) = files.get(&child) {
@@ -561,7 +581,15 @@ fn build_overlay_uncached(
                     Some(p) => link(p, &target)?,
                     None => {
                         if let Some(Some(z)) = zips.get(*owner) {
-                            fs::write(&target, z.read(inner)?)?;
+                            // One unreadable entry costs that file, not the
+                            // pack: an error here failed the build and the
+                            // reload dropped every server pack in the stack.
+                            match z.read(inner) {
+                                Ok(bytes) => fs::write(&target, bytes)?,
+                                Err(e) => log::warn!(
+                                    "Horizon: skipping unreadable pack entry {inner}: {e}"
+                                ),
+                            }
                         }
                     }
                 }
@@ -583,6 +611,7 @@ fn build_overlay_uncached(
                     vanilla,
                     out,
                     touched,
+                    hidden,
                     files,
                     merged,
                     filters,
@@ -606,6 +635,7 @@ fn build_overlay_uncached(
         vanilla,
         out,
         &touched_dirs,
+        &hidden,
         &files,
         &merged,
         &filters,
@@ -796,7 +826,9 @@ impl SelectionModel {
     /// `available` in any order; `selected` as options.txt lists them,
     /// bottom first.
     pub fn new(mut available: Vec<Selectable>, selected: &[String]) -> Self {
-        // PackRepository.available is a TreeMap by id (String.compareTo).
+        // PackRepository.discoverAvailable: every source's packs go into one
+        // TreeMap by id (String.compareTo), so `file/` packs sort among the
+        // built-in ones.
         available.sort_by(|a, b| a.id.encode_utf16().cmp(b.id.encode_utf16()));
         available.dedup_by(|a, b| a.id == b.id);
         let mut m = Self {

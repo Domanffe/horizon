@@ -2,7 +2,10 @@
 //! the parts of them commands use: `.mcfunction` functions (with macros and
 //! line continuation), function tags and predicates.
 use crate::zip::Zip;
-use horizon_world::nbt::Tag;
+use horizon_world::{
+    nbt::Tag,
+    worldgen::overrides::{self, PackFile, WorldgenOverrides},
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -476,11 +479,21 @@ impl DataStore {
     /// included, each function once).
     pub fn tag_functions(&self, id: &str) -> Vec<String> {
         let mut out = Vec::new();
-        self.expand(id, &mut out, 0);
+        let mut seen_fns = std::collections::HashSet::new();
+        let mut seen_tags = std::collections::HashSet::new();
+        self.expand(id, &mut out, &mut seen_fns, &mut seen_tags);
         out
     }
-    fn expand(&self, id: &str, out: &mut Vec<String>, depth: usize) {
-        if depth > 16 {
+    /// Depth-first walk keeping first-seen order. Each tag is expanded at most
+    /// once, so reference cycles end and nesting depth is not capped.
+    fn expand<'a>(
+        &'a self,
+        id: &'a str,
+        out: &mut Vec<String>,
+        seen_fns: &mut std::collections::HashSet<&'a str>,
+        seen_tags: &mut std::collections::HashSet<&'a str>,
+    ) {
+        if !seen_tags.insert(id) {
             return;
         }
         let Some(entries) = self.function_tags.get(id) else {
@@ -488,9 +501,9 @@ impl DataStore {
         };
         for (e, required) in entries {
             match e.strip_prefix('#') {
-                Some(inner) => self.expand(inner, out, depth + 1),
+                Some(inner) => self.expand(inner, out, seen_fns, seen_tags),
                 None => {
-                    if (self.functions.contains_key(e) || *required) && !out.contains(e) {
+                    if (self.functions.contains_key(e) || *required) && seen_fns.insert(e) {
                         out.push(e.clone());
                     }
                 }
@@ -529,9 +542,138 @@ fn hash_normalize(s: &str) -> String {
     }
 }
 
+/// The ids of `packs` (a world's, from `discover`) that are enabled, lowest
+/// priority first: those `<world>/datapacks.json` lists as enabled, in its
+/// order, then every pack it lists neither way, in name order.
+pub fn enabled_ids(world: &Path, packs: &[DataPack]) -> Vec<String> {
+    let saved: Option<serde_json::Value> = std::fs::read(world.join("datapacks.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let list = |key: &str| -> Vec<String> {
+        saved
+            .as_ref()
+            .and_then(|v| v[key].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let disabled = list("disabled");
+    let mut enabled: Vec<String> = list("enabled")
+        .into_iter()
+        .filter(|id| packs.iter().any(|p| &p.id == id))
+        .collect();
+    for p in packs {
+        if !enabled.contains(&p.id) && !disabled.contains(&p.id) {
+            enabled.push(p.id.clone());
+        }
+    }
+    enabled
+}
+
+// ---- worldgen ----------------------------------------------------------------
+
+/// The worldgen entries of `packs` (lowest priority first, the built-in pack
+/// left out: the prepared bundles are it) for the chunk generator, and what
+/// it leaves out, for the log. `biomes` says which biomes the game has: a
+/// pack's new biome is left out (the game has no colours, sounds or id for it).
+pub fn worldgen_overrides(
+    packs: &[&DataPack],
+    biomes: impl Fn(&str) -> bool,
+) -> (WorldgenOverrides, Vec<String>) {
+    let mut out = WorldgenOverrides::default();
+    let mut not_read: BTreeMap<String, usize> = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for pack in packs {
+        for file in pack.list_kinds(&overrides::PACK_KINDS) {
+            let read = || String::from_utf8(pack.read(&file)?).ok();
+            match out.add_file(&pack.id, &file, read) {
+                PackFile::Read | PackFile::Other => {}
+                PackFile::DimensionType { id, min_y, height } => warnings.push(format!(
+                    "{}: dimension type {id} (min_y {min_y}, height {height}) is not used: \
+                     the dimension keeps its vanilla build height",
+                    pack.id
+                )),
+                PackFile::NotRead(kind) => {
+                    *not_read.entry(format!("{}: {kind}", pack.id)).or_default() += 1
+                }
+                PackFile::Unreadable => warnings.push(format!("{}: {file}: unreadable", pack.id)),
+            }
+        }
+    }
+    warnings.extend(out.finish(biomes));
+    for (kind, files) in not_read {
+        warnings.push(format!("{kind}: {files} files the generator does not read"));
+    }
+    (out, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_packs_override_worldgen_in_order() {
+        let dir = std::env::temp_dir().join(format!("hz-datapack-worldgen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |pack: &str, p: &str, t: &str| {
+            let path = dir.join("datapacks").join(pack).join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, t).unwrap();
+        };
+        for pack in ["a", "b", "off"] {
+            write(pack, "pack.mcmeta", "{}");
+            write(pack, "data/minecraft/worldgen/noise/cave.json", pack);
+            write(
+                pack,
+                "data/minecraft/tags/worldgen/biome/is_hill.json",
+                "{\"values\":[]}",
+            );
+        }
+        write("a", "data/minecraft/worldgen/biome/new_peaks.json", "{}");
+        write("a", "data/minecraft/worldgen/biome/plains.json", "{}");
+        write(
+            "a",
+            "data/minecraft/worldgen/world_preset/normal.json",
+            "{}",
+        );
+        write(
+            "b",
+            "data/minecraft/dimension_type/overworld.json",
+            "{\"min_y\":-64,\"height\":2096}",
+        );
+        // `b` is enabled first, so `a` (enabled after it) wins.
+        std::fs::write(
+            dir.join("datapacks.json"),
+            "{\"enabled\":[\"file/b\",\"file/a\"],\"disabled\":[\"file/off\"]}",
+        )
+        .unwrap();
+        let packs = discover(&dir);
+        let enabled = enabled_ids(&dir, &packs);
+        assert_eq!(enabled, ["file/b", "file/a"]);
+        let enabled: Vec<&DataPack> = enabled
+            .iter()
+            .map(|id| packs.iter().find(|p| &p.id == id).unwrap())
+            .collect();
+        let (o, warnings) = worldgen_overrides(&enabled, |b| b == "minecraft:plains");
+        assert_eq!(
+            o.entries("noises").collect::<Vec<_>>(),
+            [("minecraft:cave", "a")]
+        );
+        assert_eq!(
+            o.entries("biomes").collect::<Vec<_>>(),
+            [("minecraft:plains", "{}")]
+        );
+        let tag_packs: Vec<&str> = o.tags("biome_tags").map(|(_, p, _)| p).collect();
+        assert_eq!(tag_packs, ["file/b", "file/a"]);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("height 2096"));
+        assert!(warnings[1].contains("minecraft:new_peaks"));
+        assert!(warnings[2].contains("worldgen/world_preset"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use horizon_world::nbt::parse_snbt;
 
     #[test]
@@ -633,6 +775,40 @@ mod tests {
         );
         assert!(store.predicates.contains_key("mine:p"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tag_resolution_dedupes_fast_ends_cycles_and_nests_deeply() {
+        let mut store = DataStore::default();
+        let big: Vec<(String, bool)> = (0..50_000)
+            .map(|i| (format!("t:f{}", i % 25_000), true))
+            .collect();
+        store.function_tags.insert("t:big".into(), big);
+        let start = std::time::Instant::now();
+        let got = store.tag_functions("t:big");
+        assert_eq!(got.len(), 25_000);
+        assert_eq!(got[0], "t:f0");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // A cycle terminates and keeps first-seen order.
+        store.function_tags.insert(
+            "t:a".into(),
+            vec![("#t:b".into(), true), ("t:x".into(), true)],
+        );
+        store.function_tags.insert(
+            "t:b".into(),
+            vec![("#t:a".into(), true), ("t:y".into(), true)],
+        );
+        assert_eq!(store.tag_functions("t:a"), ["t:y", "t:x"]);
+        // Nesting deeper than the old cap of 16 still resolves.
+        for i in 0..40 {
+            store
+                .function_tags
+                .insert(format!("d:{i}"), vec![(format!("#d:{}", i + 1), true)]);
+        }
+        store
+            .function_tags
+            .insert("d:40".into(), vec![("t:deep".into(), true)]);
+        assert_eq!(store.tag_functions("d:0"), ["t:deep"]);
     }
 
     #[test]
