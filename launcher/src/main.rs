@@ -6,6 +6,7 @@
 mod agents_page;
 mod art;
 mod blocks;
+mod builds_page;
 mod cli;
 mod cli_tools;
 mod collection;
@@ -68,6 +69,8 @@ use theme::Theme;
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Play,
+    /// Every build in one list (the instances), where the sidebar used to list them.
+    Builds,
     Versions,
     /// Mods, resource packs and modpacks (imported ones and the browser's).
     Mods,
@@ -86,14 +89,16 @@ impl Page {
             Ok("versions") => Page::Versions,
             Ok("notes") => Page::Notes,
             Ok("settings") => Page::Settings,
+            Ok("builds" | "instances") => Page::Builds,
             _ => Page::Play,
         }
     }
 
     /// Every page, with its name and icon: the top bar shows all but Settings, which has its
     /// own button.
-    const ALL: [(Page, &'static str, &'static str); 6] = [
+    const ALL: [(Page, &'static str, &'static str); 7] = [
         (Page::Play, "Home", "home"),
+        (Page::Builds, "Builds", "box"),
         (Page::Mods, "Mods", "package"),
         (Page::Servers, "Servers", "server"),
         (Page::Versions, "Versions", "archive"),
@@ -2047,7 +2052,43 @@ impl Launcher {
                 this.open_instance_dialog(None);
                 cx.notify();
             }));
-        let items = self.instance_items(heading, cx);
+        // One row, the build in use: the rest are on the Builds page, in one readable list.
+        let items: Vec<AnyElement> = match self.selected_instance().cloned() {
+            Some(instance) => {
+                let tag = self.version_of(&instance).cloned();
+                let prepared = tag.as_deref().is_some_and(backend::is_prepared);
+                let line = match (&tag, &instance.java) {
+                    (_, Some(java)) => format!("Minecraft {}", java.minecraft),
+                    (Some(tag), None) => format!(
+                        "{tag} · {}",
+                        tr(if prepared { "Ready" } else { "Needs preparing" })
+                    ),
+                    (None, None) => tr("No version installed").to_string(),
+                };
+                let icon = self.instance_icon(&instance, 44.);
+                vec![blocks::side_item(
+                    SharedString::from("side-instance-current"),
+                    self.page == Page::Builds,
+                    &t,
+                )
+                .child(icon)
+                .child(dot(if prepared { t.success } else { t.warn }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(title(instance.name.clone()))
+                        .child(sub(line)),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.go(Page::Builds);
+                    cx.notify();
+                }))
+                .into_any_element()]
+            }
+            None => Vec::new(),
+        };
         let mut rows = items.len();
         let list = div()
             .flex()
@@ -4255,6 +4296,7 @@ impl Render for Launcher {
         let banner_width = f32::from(size.width) - theme::SIDEBAR - scrollbar::GUTTER;
         let content = match self.page {
             Page::Play => self.play_page(banner_width, cx),
+            Page::Builds => self.builds_page(cx),
             Page::Versions => self.versions_page(cx),
             Page::Mods => self.mods_page(cx),
             Page::Servers => self.servers_page(cx),
