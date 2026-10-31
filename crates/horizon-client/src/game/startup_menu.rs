@@ -34,6 +34,7 @@ impl StartupMenu {
                 address: address.clone(),
                 name: options.player_name(),
                 cookies: None,
+                lan: false,
             })
         } else {
             options
@@ -77,12 +78,19 @@ impl StartupMenu {
             );
             title.last_server = settings.file.string("lastServer");
             title.skip_multiplayer_warning = settings.file.bool("skipMultiplayerWarning");
+            // Gui.addInitialScreens: the accessibility onboarding comes first.
+            if settings.file.bool("onboardAccessibility") {
+                title.start_onboarding();
+            }
             self.title = Some(title);
         }
     }
 
     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
-        game.title = self.title.take();
+        game.title = self
+            .title
+            .take()
+            .map(|title| title.with_user(|| game.options.player_name()));
         game.pending_entry = self.pending.take();
         game.cursor = self.cursor;
         game.modifiers = self.modifiers;
@@ -124,10 +132,11 @@ impl StartupMenu {
                 creative,
                 create: Some(Box::new(options)),
             },
-            Action::Connect { address } => PendingWorldEntry::Server {
+            Action::Connect { address, lan } => PendingWorldEntry::Server {
                 address,
                 name: player_name,
                 cookies: None,
+                lan,
             },
             _ => return,
         };
@@ -149,9 +158,12 @@ impl StartupMenu {
         )
     }
 
-    fn title_key(&mut self, event: &KeyEvent) {
+    /// `Screen.keyPressed` on the title screens: the action a key starts (Enter confirms, see `confirm_key` in title.rs).
+    fn title_key(&mut self, event: &KeyEvent) -> Action {
         let shortcut = self.shortcut(event);
-        let Some(title) = &mut self.title else { return };
+        let Some(title) = &mut self.title else {
+            return Action::None;
+        };
         if let Some(shortcut) = shortcut {
             if title.has_caret_field() {
                 title.field_shortcut(shortcut, &mut self.clipboard);
@@ -164,13 +176,16 @@ impl StartupMenu {
             {
                 title.search_changed();
             }
-            return;
+            return Action::None;
         }
         match event.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => title.escape(),
             PhysicalKey::Code(KeyCode::F5) => title.refresh_servers(),
             PhysicalKey::Code(KeyCode::Tab) => title.tab(),
-            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => title.confirm_edit(),
+            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => return title.confirm_key(),
+            PhysicalKey::Code(KeyCode::Space) if title.list_focused() => {
+                return title.confirm_key();
+            }
             PhysicalKey::Code(
                 key @ (KeyCode::Backspace
                 | KeyCode::Delete
@@ -202,6 +217,7 @@ impl StartupMenu {
                 }
             }
         }
+        Action::None
     }
 }
 
@@ -227,6 +243,7 @@ pub(super) fn spawn_loader(
     let settings = settings.clone();
     let vanilla_root = vanilla_root.to_path_buf();
     let dev_mods = options.dev_mods.clone();
+    let world = launch_world(options).map(str::to_owned);
     let progress = progress.clone();
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
@@ -240,10 +257,12 @@ pub(super) fn spawn_loader(
             let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
             let result = load_resources(
                 root,
+                world.as_deref(),
                 &vanilla_root,
                 &settings,
                 started,
                 true,
+                false,
                 &progress,
                 &mut |gui, root| {
                     let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
@@ -276,11 +295,12 @@ impl Loading {
                     Err(TryRecvError::Disconnected) => {
                         // The loader sends `Done` before it returns: it panicked.
                         let reason = match self.handle.take().map(JoinHandle::join) {
-                            Some(Err(payload)) => format!(": {}", panic_text(payload.as_ref())),
-                            _ => String::new(),
+                            Some(Err(payload)) => panic_text(payload.as_ref()).to_owned(),
+                            Some(Ok(())) => "it returned without a result".into(),
+                            None => "no loader thread was running".into(),
                         };
                         return Err(
-                            format!("resource loader stopped before finishing{reason}").into()
+                            format!("resource loader stopped before finishing: {reason}").into(),
                         );
                     }
                 }
@@ -298,10 +318,26 @@ impl Loading {
             gui.atlas.font.uniform = self.settings.force_unicode;
             gui.atlas.font.japanese = self.settings.japanese_glyphs;
         }
-        if let Some(window) = &self.window
-            && let Some(want) = self.fullscreen.request(self.settings.fullscreen)
-        {
-            window.set_fullscreen(want.then_some(winit::window::Fullscreen::Borderless(None)));
+        if let Some(window) = self.window.clone() {
+            let modes = window
+                .current_monitor()
+                .or_else(|| window.primary_monitor())
+                .map(|m| horizon_client::window::monitor_video_modes(&m))
+                .unwrap_or_default();
+            let preferred = self
+                .settings
+                .file
+                .fullscreen_resolution
+                .as_deref()
+                .and_then(horizon_client::window::VideoMode::read);
+            self.fullscreen.apply(
+                &window,
+                self.settings.fullscreen,
+                self.settings.file.bool("exclusiveFullscreen"),
+                preferred,
+                false,
+            );
+            self.settings.video_modes = modes;
         }
         self.update_menu_cursor();
     }
@@ -426,8 +462,9 @@ impl Loading {
                 }
                 // Mods' settings pages open only in a running game.
                 Event::NativeSettings(_) | Event::NativeButton(..) => {}
-                // The startup menu runs before the game opens a control socket.
-                Event::ButtonClick | Event::CopyAgentDetails => {}
+                // The startup menu runs before the game opens a control socket,
+                // and before its sound engine (no clicks, no volume previews).
+                Event::ButtonClick | Event::CopyAgentDetails | Event::Volume(..) => {}
             }
         }
     }
@@ -455,6 +492,13 @@ impl Loading {
             Action::Options => self.open_menu_options(Page::Main),
             Action::Accessibility => self.open_menu_options(Page::Accessibility),
             Action::Language => self.open_menu_options(Page::Language),
+            Action::Sounds => self.open_menu_options(Page::Sound),
+            Action::Credits => self.open_menu_options(Page::Credits),
+            Action::OpenUri(uri) => super::packs::open_uri(&uri),
+            Action::CopyText(text) => {
+                use horizon_client::clipboard::Clipboard;
+                self.menu.clipboard.set(&text);
+            }
             Action::DataPacks { dir, selected } => {
                 let resources = self.vanilla_root.clone();
                 self.menu.options.open_data_packs(dir, selected, resources);
@@ -487,6 +531,14 @@ impl Loading {
         }
         match event {
             WindowEvent::CloseRequested => {
+                if !self.settings.quit_shortcuts
+                    && horizon_client::input::is_quit_shortcut_down(
+                        self.menu.modifiers,
+                        &self.menu.physical_keys,
+                    )
+                {
+                    return Ok(());
+                }
                 self.save_menu_settings();
                 event_loop.exit();
             }
@@ -603,14 +655,17 @@ impl Loading {
                 } else {
                     raw
                 } * self.settings.mouse_wheel_sensitivity;
-                let batch = HudBatch::new(self.menu_size());
+                let size = self.menu_size();
+                let batch = HudBatch::new(size);
                 if self.menu.options_open {
-                    self.menu.options.scroll_at(
-                        &self.settings,
+                    let events = self.menu.options.wheel(
+                        &mut self.settings,
                         (batch.width, batch.height),
                         self.menu.cursor,
+                        [size[0] as i32, size[1] as i32],
                         amount,
                     );
+                    self.menu_option_events(events);
                 } else if let Some(title) = &mut self.menu.title {
                     title.scroll_worlds(amount, self.menu.cursor, (batch.width, batch.height));
                 }
@@ -638,8 +693,8 @@ impl Loading {
                         self.menu_option_events(events);
                     }
                 } else {
-                    self.menu.title_key(&event);
-                    self.save_menu_address();
+                    let action = self.menu.title_key(&event);
+                    self.menu_action(event_loop, action);
                 }
             }
             _ => {}
@@ -648,13 +703,20 @@ impl Loading {
     }
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
-        let Some(gui) = &self.gui else { return };
+        let logs = horizon_client::logging::recent_lines();
+        let Some(gui) = &self.gui else {
+            // The pack's screens do not exist yet: the boot screen holds the
+            // window, the wordmark and the console's lines while they load.
+            horizon_client::ui_theme::draw_boot(&self.boot, batch, &logs);
+            return;
+        };
         if self.menu.pending.is_some() {
-            horizon_client::level_loading::draw_progress(
+            horizon_client::level_loading::draw_loading_overlay(
                 batch,
                 &gui.atlas,
                 self.progress.line(),
                 self.progress.fraction(),
+                self.settings.file.bool("darkMojangStudiosBackground"),
             );
         } else if let Some((win, frame)) = &mut self.menu.win {
             let now = Instant::now();
@@ -671,9 +733,22 @@ impl Loading {
                 .draw(&self.settings, batch, &gui.atlas, self.menu.cursor);
         } else if let Some(title) = &mut self.menu.title {
             title.poll_backup();
+            if std::mem::take(&mut title.onboarding_finished) {
+                // Options.onboardingAccessibilityFinished.
+                self.settings.file.set(
+                    "onboardAccessibility",
+                    horizon_client::options_file::V::Bool(false),
+                );
+                self.settings.save(&Game::options_path());
+            }
             let _ = title.update_toast(self.settings.notification_display_time);
-            title.draw(
+            let items = match &self.loaded {
+                Some(Ok(loaded)) => Some(&*loaded.pack.item_renderer),
+                _ => None,
+            };
+            title.draw_with_items(
                 &gui.atlas,
+                items,
                 batch,
                 self.menu.cursor,
                 self.settings.file.bool("hideSplashTexts"),
@@ -738,6 +813,7 @@ mod tests {
         Loading {
             window: None,
             renderer: None,
+            boot: horizon_client::hud::HudAtlas::boot(),
             gui: None,
             settings: Settings::default(),
             fullscreen: horizon_client::window::FullscreenState::new(false),
@@ -812,16 +888,17 @@ mod tests {
     }
 
     #[test]
-    fn queued_server_keeps_address_and_player_identity() {
+    fn queued_server_keeps_address_player_identity_and_lan_kind() {
         let mut menu = StartupMenu::default();
         menu.queue_entry(
             Action::Connect {
                 address: "localhost:25565".into(),
+                lan: true,
             },
             "Guest".into(),
         );
         assert!(
-            matches!(menu.pending.take(), Some(PendingWorldEntry::Server { address, name, .. })
+            matches!(menu.pending.take(), Some(PendingWorldEntry::Server { address, name, lan: true, .. })
             if address == "localhost:25565" && name == "Guest")
         );
         assert!(menu.pending.take().is_none(), "an entry is consumed once");
@@ -875,7 +952,7 @@ mod tests {
         let mut loading = loading(receiver);
         assert_eq!(
             loading.poll_menu_resources().unwrap_err().to_string(),
-            "resource loader stopped before finishing"
+            "resource loader stopped before finishing: no loader thread was running"
         );
     }
 }

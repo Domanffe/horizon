@@ -83,7 +83,9 @@ impl merchant::MapMaker for GameMaps<'_> {
             origin[1].floor() as i32,
             origin[2].floor() as i32,
         ];
-        let Some((_, at)) = terrain.locate(&names, from, map.search_radius) else {
+        let Some((_, at)) =
+            terrain.locate_for_map(&names, from, map.search_radius, map.skip_existing_chunks)
+        else {
             return stack;
         };
         let id = self.next_id.get();
@@ -151,7 +153,7 @@ impl Game<'_> {
         variant: &str,
         origin: [f64; 3],
     ) -> Vec<MerchantOffer> {
-        let Some(sequence) = self.res.stations().trades.sequence(set) else {
+        let Some(sequence) = self.stations().trades.sequence(set) else {
             return Vec::new();
         };
         let mut random = self.rand_sequences.lend(&sequence, self.level.seed);
@@ -164,8 +166,8 @@ impl Game<'_> {
             next_id: std::cell::Cell::new(next_map),
         };
         let ctx = TradeContext {
-            items: self.res.items(),
-            enchantments: &self.res.stations().enchantments,
+            items: self.items(),
+            enchantments: &self.stations().enchantments,
             variant,
             origin,
             maps: Some(&maps),
@@ -209,7 +211,7 @@ impl Game<'_> {
                 let profession = PROFESSIONS[m.extra.variant2 as usize % PROFESSIONS.len()];
                 let level = i32::from(m.extra.variant3.max(1));
                 let set = merchant::Trades::set_for(profession, level);
-                if self.res.stations().trades.sets.contains_key(&set) {
+                if self.stations().trades.sets.contains_key(&set) {
                     self.offers_from_set(&set, &variant, origin)
                 } else {
                     Vec::new()
@@ -288,7 +290,7 @@ impl Game<'_> {
             session.reputation = self.villager_reputation(id);
             session.hero = self.hero_amplifier();
             for seq in merchant::Session::sequences_needed(
-                &self.res.stations().trades,
+                &self.stations().trades,
                 &session.profession,
                 level,
             ) {
@@ -451,7 +453,14 @@ impl Game<'_> {
                 merchant::Event::Traded(index) => {
                     traded.extend(session.offers.get(index).map(|o| o.result.clone()));
                 }
-                merchant::Event::TradeSound => {}
+                merchant::Event::TradeSound => {
+                    let sound = if villager {
+                        "minecraft:entity.villager.yes"
+                    } else {
+                        "minecraft:entity.wandering_trader.yes"
+                    };
+                    self.audio.play(sound, Some(origin), 1.0, 1.0);
+                }
             }
         }
         (session, traded)
@@ -472,6 +481,34 @@ impl Game<'_> {
     /// `Villager.customServerAiStep`: the TRADE reputation event of the last
     /// trade, a tick later; the prices follow the new reputation.
     pub(super) fn merchant_tick(&mut self) {
+        // `AbstractVillager.stillValid`: the trade screen closes once the trader
+        // is gone or dead, or the player is more than 4 blocks past their reach.
+        if self.remote.is_none()
+            && self.screen == super::Screen::Inventory
+            && let Some(id) = self
+                .station
+                .as_ref()
+                .and_then(|s| s.merchant.as_ref())
+                .and_then(|m| m.mob)
+            && let Some(eye) = self.eye_position()
+        {
+            let valid = self.mobs.iter().find(|m| m.id == id).is_some_and(|m| {
+                let (lo, hi) = (m.bounds().min_position(), m.bounds().max_position());
+                let d = [
+                    eye[0] - eye[0].clamp(lo.x, hi.x),
+                    eye[1] - eye[1].clamp(lo.y, hi.y),
+                    eye[2] - eye[2].clamp(lo.z, hi.z),
+                ];
+                let range = self.entity_reach + 4.0;
+                m.alive() && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < range * range
+            });
+            if !valid {
+                self.close_container();
+                self.screen = super::Screen::Playing;
+                self.capture(true);
+                return;
+            }
+        }
         let Some(m) = self.station.as_mut().and_then(|s| s.merchant.as_mut()) else {
             return;
         };
@@ -537,6 +574,31 @@ impl Game<'_> {
         }
         false
     }
+    /// `AbstractButton.keyPressed` on the focused offer button: Enter or
+    /// Space presses it again, key repeats included, so holding Space
+    /// refills the payment slots after every trade. Focus stays on the
+    /// button through slot clicks (`ContainerEventHandler.mouseClicked`).
+    pub(super) fn merchant_key(&mut self, key: winit::keyboard::KeyCode) -> bool {
+        use winit::keyboard::KeyCode;
+        if !matches!(key, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+            return false;
+        }
+        let Some(m) = self.station.as_ref().and_then(|s| s.merchant.as_ref()) else {
+            return false;
+        };
+        // Buttons past the last offer are hidden, and a hidden button is inactive.
+        let Some(index) = m
+            .focused
+            .map(|row| row + m.scroll)
+            .filter(|&index| index < m.session.offers.len())
+        else {
+            return false;
+        };
+        self.audio
+            .play("minecraft:ui.button.click", None, 0.25, 1.0);
+        self.try_move_items(index);
+        true
+    }
     /// The offer buttons a controller can focus (GUI origin relative).
     pub(super) fn merchant_targets(&self) -> Vec<[f32; 4]> {
         let Some(m) = self.station.as_ref().and_then(|s| s.merchant.as_ref()) else {
@@ -594,7 +656,7 @@ impl Game<'_> {
             m.focused,
         );
         let offers = m.session.offers.clone();
-        let costs: Vec<ItemStack> = offers.iter().map(|o| o.cost_a(self.res.items())).collect();
+        let costs: Vec<ItemStack> = offers.iter().map(|o| o.cost_a(self.items())).collect();
         let atlas = &self.gui.atlas;
         batch.fill(
             atlas,
@@ -610,8 +672,7 @@ impl Game<'_> {
             r.v1 = r.v0 + 166.0 * dv;
             batch.rect_uv(ox + SHIFT, oy, 276.0, 166.0, r, u32::MAX);
         }
-        let e = &self.res.stations().enchantments;
-        let tr = |k: &str, f: &str| e.translate(k).unwrap_or(f).to_owned();
+        let tr = |k: &str, f: &str| horizon_client::lang::get_or(k, f);
         let name = custom.unwrap_or_else(|| {
             if progress {
                 tr(
@@ -809,24 +870,17 @@ impl Game<'_> {
         // Slots, hover highlight, carried stack, tooltip.
         let slots: Vec<usize> = (0..36).chain([INPUT, INPUT + 1, RESULT]).collect();
         let drag = self.drag_view();
+        self.draw_hovered_slot_highlight(batch, false, ox, oy);
         for i in slots {
             let (sx, sy) = self.slot_position(i);
             let stack = self.slot_mut(i).clone();
             self.draw_slot_item(batch, drag.as_ref(), i, &stack, ox + sx, oy + sy);
         }
-        if let Some(slot) = self.slot_at(batch, self.cursor.0, self.cursor.1) {
-            let (sx, sy) = self.slot_position(slot);
-            batch.fill(
-                &self.gui.atlas,
-                ox + sx,
-                oy + sy,
-                16.0,
-                16.0,
-                rgba(255, 255, 255, 128),
-            );
-            if self.carried.is_none() && tooltip.is_none() {
-                tooltip = self.slot_mut(slot).clone();
-            }
+        self.draw_hovered_slot_highlight(batch, true, ox, oy);
+        if let Some(slot) = self.slot_at(batch, self.cursor.0, self.cursor.1)
+            && tooltip.is_none()
+        {
+            tooltip = self.slot_mut(slot).clone();
         }
         // An out-of-stock trade: "the villager needs to restock" over the
         // result (isHovering(186, 35, 22, 21), canRestock).
@@ -838,14 +892,14 @@ impl Game<'_> {
             && local.1 < 35.0 + 21.0 + 1.0;
         if self.carried.is_some() {
             self.draw_carried(batch);
+            if let Some(stack) = tooltip.filter(|s| self.tooltip_with_carried(s)) {
+                self.draw_stack_tooltip(batch, &stack, self.cursor.0, self.cursor.1);
+            }
         } else if deprecated {
-            let text = self
-                .res
-                .stations()
-                .enchantments
-                .translate("merchant.deprecated")
-                .unwrap_or("Villagers restock up to two times per day.")
-                .to_owned();
+            let text = horizon_client::lang::get_or(
+                "merchant.deprecated",
+                "Villagers restock up to two times per day.",
+            );
             let lines: Vec<(String, u32)> =
                 text.split('\n').map(|l| (l.to_owned(), u32::MAX)).collect();
             self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);

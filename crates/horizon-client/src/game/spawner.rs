@@ -96,6 +96,15 @@ impl Game<'_> {
         });
     }
     fn server_tick_spawner(&mut self, key: Pos, spawner: &mut Spawner) -> Result<()> {
+        // `BaseSpawner.serverTick` does nothing without an alive player in
+        // range (`isNearPlayer`) or with the rule off: no level to build for it.
+        let at = [key.0, key.1, key.2].map(|c| f64::from(c) + 0.5);
+        let range = f64::from(spawner.required_player_range);
+        if !self.alive_player_near(at[0], at[1], at[2], range)
+            || !self.ui.rules.bool("spawner_blocks_work")
+        {
+            return Ok(());
+        }
         let pos = [key.0, key.1, key.2];
         let mut random = std::mem::replace(
             &mut self.world.random,
@@ -126,7 +135,9 @@ impl Game<'_> {
                     mob.id = self.next_entity;
                     let id = mob.id;
                     self.mobs.push(mob);
+                    self.native_mobs_joined(self.mobs.len() - 1, false);
                     self.enchant_spawn_equipment(id);
+                    self.halloween_spawn_head(id);
                     self.spawn_jockeys(id, true);
                     Some((id, equipment))
                 }
@@ -202,7 +213,12 @@ impl Game<'_> {
                 tag.insert("PersistenceRequired".into(), Tag::Byte(1));
             }
             let tag = Tag::Compound(tag);
-            let mob = horizon_client::entity_nbt::mob_from_nbt(&tag, self.res.mob_types(), 0)?;
+            let mob = horizon_client::entity_nbt::mob_from_nbt(
+                &tag,
+                self.res.mob_types(),
+                0,
+                Some(self.pack.assets.registry),
+            )?;
             let bounds = mob.bounds();
             planned.push(Planned::Loaded(tag, r.equipment.cloned()));
             bounds
@@ -392,10 +408,13 @@ impl Game<'_> {
             return Some(false);
         }
         if trial {
-            // TrialSpawnerBlockEntity.setEntityId: overrideEntityToSpawn, which
-            // ends in setState(INACTIVE).
+            // TrialSpawnerBlockEntity.setEntityId and setEntityData:
+            // overrideEntityToSpawn, which ends in setState(INACTIVE).
             if let Some(BlockEntity::TrialSpawner(t)) = self.world.block_entities.get_mut(&key) {
-                t.override_entity(kind);
+                match data {
+                    Some(data) => t.override_entity_data(kind, data),
+                    None => t.override_entity(kind),
+                }
             }
             let ominous = self.trial_spawner_block(key).is_some_and(|(_, o)| o);
             let _ = self.set_trial_spawner_state(key, TrialState::Inactive, ominous);

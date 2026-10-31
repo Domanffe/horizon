@@ -26,7 +26,18 @@ impl Launcher {
         let chosen = self.selected_instance().map(|i| i.id.clone());
         let list = self.instances.list.clone();
         let mut rows: Vec<AnyElement> = Vec::with_capacity(list.len());
+        let mut group = None;
         for instance in list {
+            // The group a build was put in is only visible here: the sidebar shows one row now.
+            if instance.group != group {
+                group = instance.group.clone();
+                if let Some(name) = &group {
+                    rows.push(
+                        shell::heading(name.to_uppercase(), &t)
+                            .into_any_element(),
+                    );
+                }
+            }
             let open = chosen.as_ref() == Some(&instance.id);
             let tag = self.version_of(&instance).cloned();
             let prepared = tag.as_deref().is_some_and(backend::is_prepared);
