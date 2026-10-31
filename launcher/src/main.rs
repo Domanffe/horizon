@@ -2140,14 +2140,15 @@ impl Launcher {
             |this, _: &ClickEvent, _, cx| {
                 this.open_instance_dialog(None);
                 cx.notify();
-            }));
+            },
+        ));
         // One row, the build in use: the rest are on the Builds page, in one readable list.
         let items: Vec<AnyElement> = match self.selected_instance().cloned() {
             Some(instance) => {
                 let tag = self.version_of(&instance).cloned();
                 let prepared = tag.as_deref().is_some_and(backend::is_prepared);
                 let line = match (&tag, &instance.java) {
-                    (_, Some(java)) => format!("Minecraft {}", java.minecraft),
+                    (_, Some(java)) => instances_page::java_line(java),
                     (Some(tag), None) => format!(
                         "{} · {tag}",
                         tr(if prepared { "Ready" } else { "Needs preparing" })
@@ -2158,21 +2159,19 @@ impl Launcher {
                     },
                 };
                 let icon = self.instance_icon(&instance, 44.);
-                vec![blocks::side_item(
+                // Java instances have nothing of Horizon's to prepare: no state square.
+                let state =
+                    instance
+                        .java
+                        .is_none()
+                        .then_some(if prepared { t.success } else { t.warn });
+                vec![shell::row(
                     SharedString::from("side-instance-current"),
                     self.page == Page::Builds,
                     &t,
                 )
-                .child(icon)
-                .child(dot(if prepared { t.success } else { t.warn }))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w_0()
-                        .child(title(instance.name.clone()))
-                        .child(sub(line)),
-                )
+                .child(div().relative().child(icon))
+                .child(shell::row_text(instance.name.clone(), line, state, &t))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.go(Page::Builds);
                     cx.notify();
@@ -2180,7 +2179,8 @@ impl Launcher {
                 .into_any_element()]
             }
             None => Vec::new(),
-        };        let mut rows = items.len();
+        };
+        let mut rows = items.len();
         let list = div()
             .flex()
             .flex_col()

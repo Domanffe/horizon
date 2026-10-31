@@ -794,7 +794,7 @@ pub(super) fn played_line(instance: &Instance) -> String {
 }
 
 /// A Java instance's line in the sidebar: "Java 1.21.4", and its loader ("· Fabric 0.16.9").
-fn java_line(j: &instances::JavaGame) -> String {
+pub(super) fn java_line(j: &instances::JavaGame) -> String {
     match &j.loader {
         Some(l) => format!("Java {} · {} {}", j.minecraft, l.kind.name(), l.version),
         None => format!("Java {}", j.minecraft),

@@ -481,5 +481,8 @@
   "Building {name}'s post-build step": "Compilando a etapa pós-compilação de {name}",
   "Running {name}'s post-build step": "Executando a etapa pós-compilação de {name}",
   "Installing the build": "Instalando a compilação",
-  "Release build: slower to build, slightly faster game": "Compilação release: mais lenta para compilar, jogo um pouco mais rápido"
+  "Release build: slower to build, slightly faster game": "Compilação release: mais lenta para compilar, jogo um pouco mais rápido",
+  "Builds": "Instâncias",
+  "New build": "Nova instância",
+  "Every build in one list: the version it plays, and whether that version is ready.": "Todas as instâncias em uma lista: a versão que cada uma joga e se ela está pronta."
 }

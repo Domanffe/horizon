@@ -32,10 +32,7 @@ impl Launcher {
             if instance.group != group {
                 group = instance.group.clone();
                 if let Some(name) = &group {
-                    rows.push(
-                        shell::heading(name.to_uppercase(), &t)
-                            .into_any_element(),
-                    );
+                    rows.push(shell::heading(name.to_uppercase(), &t).into_any_element());
                 }
             }
             let open = chosen.as_ref() == Some(&instance.id);
@@ -43,17 +40,25 @@ impl Launcher {
             let prepared = tag.as_deref().is_some_and(backend::is_prepared);
             let sub = match &instance.kind {
                 // The states the sidebar's row had, in the same order: a Java instance first.
-                InstanceKind::Default | InstanceKind::Own => match (&tag, &instance.version) {
-                    _ if instance.java.is_some() => format!(
-                        "Minecraft {} · Java",
-                        instance.java.as_ref().map_or("", |j| &j.minecraft)
-                    ),
-                    (None, Some(own)) => trf("{version} is not installed", &[("version", own)]),
-                    (None, None) => tr("No version installed").to_string(),
-                    (Some(_), _) if !prepared => tr("Needs preparing").to_string(),
-                    (Some(tag), Some(_)) => format!("{} · {tag}", tr("Ready")),
-                    (Some(_), None) => tr("Ready").to_string(),
-                },
+                InstanceKind::Default | InstanceKind::Own => {
+                    match (&instance.java, &tag, &instance.version) {
+                        (Some(java), _, _) => instances_page::java_line(java),
+                        (None, None, Some(own)) => {
+                            trf("{version} is not installed", &[("version", own)])
+                        }
+                        (None, None, None) => tr("No version installed").to_string(),
+                        (None, Some(_), _) if !prepared => tr("Needs preparing").to_string(),
+                        (None, Some(tag), _) if self.native_build_of(tag).is_some() => {
+                            let build = self.native_build_of(tag).unwrap_or_default();
+                            trf(
+                                "Native build · {version}",
+                                &[("version", &build.horizon_short())],
+                            )
+                        }
+                        (None, Some(tag), Some(_)) => format!("{} · {tag}", tr("Ready")),
+                        (None, Some(_), None) => tr("Ready").to_string(),
+                    }
+                }
                 InstanceKind::Port => {
                     let slug = &instance.id["port:".len()..];
                     self.packs
